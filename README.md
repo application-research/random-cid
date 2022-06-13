@@ -30,4 +30,5 @@ The API endpoints are:
 - `GET /`: returns a random CID v1
 - `GET /v0`: returns a random CID v0
 - `GET /v1`: returns a random CID v1
+- `GET /peer`: returns the libp2p peer address for the random-cid ipfs node
 

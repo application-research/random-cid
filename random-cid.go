@@ -1,33 +1,112 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"os"
 
+	"github.com/application-research/random-cid/ipfslite"
 	"github.com/brianvoe/gofakeit/v6"
 	"github.com/gin-gonic/gin"
-	cid "github.com/ipfs/go-cid"
-	mc "github.com/multiformats/go-multicodec"
-	mh "github.com/multiformats/go-multihash"
+	"github.com/ipfs/go-cid"
+	"github.com/libp2p/go-libp2p-core/crypto"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multicodec"
+	"github.com/multiformats/go-multihash"
 	"github.com/urfave/cli/v2"
 )
 
-func NewCid(version int) (cid.Cid, error) {
-	pref := cid.Prefix{
-		Version:  uint64(version),
-		Codec:    uint64(mc.Raw),
-		MhType:   mh.SHA2_256,
-		MhLength: -1, // default length
+type newCid struct {
+	Reader  io.Reader
+	Version int
+}
+
+var newFiles = make(chan newCid)
+var cidout = make(chan string)
+var peerID peer.ID
+
+func newIpfsDaemon() *ipfslite.Peer {
+	ctx := context.Background()
+
+	ds := ipfslite.NewInMemoryDatastore()
+	priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	if err != nil {
+		fmt.Printf("error: %s\n", err)
 	}
 
-	// And then feed it some data
-	c, err := pref.Sum([]byte(gofakeit.HackerPhrase())) // random hacker phrase
+	listen, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/4005")
+
+	h, dht, err := ipfslite.SetupLibp2p(
+		ctx,
+		priv,
+		nil,
+		[]multiaddr.Multiaddr{listen},
+		ds,
+		ipfslite.Libp2pOptionsExtra...,
+	)
+
 	if err != nil {
-		return cid.Cid{}, err
+		fmt.Printf("error: %s\n", err)
 	}
-	return c, nil
+
+	lite, err := ipfslite.New(ctx, ds, h, dht, nil)
+	if err != nil {
+		fmt.Printf("error: %s\n", err)
+	}
+
+	fmt.Println("IPFS peer address: ", h.ID())
+	peerID = h.ID()
+	return lite
+}
+
+func ipfsDaemon() {
+	fmt.Println("Starting IPFS daemon")
+	ctx := context.Background()
+
+	lite := newIpfsDaemon()
+	lite.Bootstrap(ipfslite.DefaultBootstrapPeers())
+	fmt.Println("IPFS daemon started!")
+
+	for {
+		select {
+		case newCid := <-newFiles:
+			pref := cid.Prefix{
+				Version:  uint64(newCid.Version),
+				Codec:    uint64(multicodec.Raw),
+				MhType:   multihash.SHA2_256,
+				MhLength: -1, // default length
+			}
+
+			fmt.Println("Adding new cid to blockstore")
+			node, err := lite.AddFile(ctx, newCid.Reader, &ipfslite.AddParams{Prefix: &pref}) // add file
+			if err != nil {
+				fmt.Println("Could not add node to blockstore: ", err)
+
+			}
+			fmt.Println("Added CID to blockstore: ", node.Cid())
+			cidout <- node.Cid().String()
+		}
+	}
+}
+
+func NewCid(version int) (string, error) {
+	// And then feed it some data
+	data := []byte(gofakeit.HackerPhrase()) // random hacker phrase
+
+	fmt.Println("Adding cid to local blockstore...")
+	newFiles <- newCid{Reader: bytes.NewReader(data), Version: version}
+	addedCid := <-cidout
+	fmt.Println("Added cid: ", addedCid)
+
+	return addedCid, nil
+}
+
+func getPeerID(ctx *gin.Context) {
+	ctx.String(http.StatusOK, peerID.String()+"\n")
 }
 
 func getCidV1(ctx *gin.Context) {
@@ -37,7 +116,7 @@ func getCidV1(ctx *gin.Context) {
 		ctx.String(http.StatusInternalServerError, fmt.Sprintf("%v", err))
 		return
 	}
-	ctx.String(http.StatusOK, c.String()+"\n")
+	ctx.String(http.StatusOK, c+"\n")
 }
 
 func getCidV0(ctx *gin.Context) {
@@ -47,7 +126,7 @@ func getCidV0(ctx *gin.Context) {
 		ctx.String(http.StatusInternalServerError, fmt.Sprintf("%v", err))
 		return
 	}
-	ctx.String(http.StatusOK, c.String()+"\n")
+	ctx.String(http.StatusOK, c+"\n")
 }
 
 func main() {
@@ -72,13 +151,14 @@ func main() {
 					router.GET("/", getCidV1)
 					router.GET("/v1", getCidV1)
 					router.GET("/v0", getCidV0)
+					router.GET("/peer", getPeerID)
 
 					port := os.Getenv("PORT")
 					if port == "" {
-						port = "8080"
+						port = "8081"
 					}
 					if err := router.Run(":" + port); err != nil {
-						log.Panicf("error: %s", err)
+						fmt.Printf("error: %s\n", err)
 					}
 					return nil
 				},
@@ -101,8 +181,10 @@ func main() {
 		},
 	}
 
+	go ipfsDaemon()
+
 	err := app.Run(os.Args)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("error: ", err)
 	}
 }
